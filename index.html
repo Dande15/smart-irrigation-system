@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Smart Irrigation System</title>
+</head>
+<body>
+  <h1>Smart Irrigation System for Small Farmers</h1>
+  <p>By: Dalitso Mbewe</p>
+
+  <h2>Project Code</h2>
+  <pre>
+    (// ---------------- BLYNK CONFIG ----------------
+#define BLYNK_TEMPLATE_ID "TMPL2DMVhLEEo"
+#define BLYNK_TEMPLATE_NAME "Smart Irrigation System for small time farmers"
+#define BLYNK_AUTH_TOKEN "KJxdixwccmMzjIDpxR6beTVjOquV652Z"
+
+// ---------------- LIBRARIES ----------------
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+#include <LiquidCrystal_I2C.h>
+
+// ---------------- PIN DEFINITIONS ----------------
+#define DHTPIN 4
+#define DHTTYPE DHT22
+#define SOIL_SENSOR 34
+#define LDR_SENSOR 35
+#define RELAY_PIN 16
+#define BUTTON_PIN 15
+#define BUZZER_PIN 27
+#define LED_PIN 14
+#define OFFLINE_LED 26
+
+// ---------------- OBJECTS ----------------
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+BlynkTimer timer;
+
+// === WiFi Credentials ===
+char ssid[] = "Airtel 4G MiFi_2181E4";
+char pass[] = "01151918";
+const unsigned long WIFI_TIMEOUT_MS = 12000UL; // 12 seconds max
+
+// ---------------- VARIABLES ----------------
+bool manualMode = false;
+bool pumpState = false;
+bool buzzerActive = false;
+bool buzzerState = false;
+bool offlineMode = false;
+unsigned long manualStartTime = 0;
+unsigned long buzzerStartAt = 0;
+unsigned long lastBeepToggle = 0;
+
+const unsigned long manualDuration = 150000;
+const unsigned long BUZZER_DURATION_MS = 12000UL;
+const unsigned long BEEP_INTERVAL_MS = 400UL;
+
+int moistureThreshold = 50;
+const int soilMin = 1150;   // ✅ Updated calibration
+const int soilMax = 3000;   // ✅ Adjusted range for ESP32 ADC
+
+String weatherURL = "http://api.openweathermap.org/data/2.5/weather?id=7839184&appid=59bed9edbb5b12272391312939bf6d60&units=metric";
+String lastWeatherDesc = "Unknown";
+float lastWeatherTemp = 0;
+
+// ---------------- MANUAL MODE ----------------
+BLYNK_WRITE(V4) {
+  int buttonState = param.asInt();
+  manualMode = buttonState;
+  manualStartTime = millis();
+
+  if (manualMode) {
+    digitalWrite(RELAY_PIN, HIGH);
+    pumpState = true;
+    lcd.setCursor(0, 3); lcd.print("Manual Mode: ON   ");
+  } else {
+    digitalWrite(RELAY_PIN, LOW);
+    pumpState = false;
+    lcd.setCursor(0, 3); lcd.print("Manual Mode: OFF  ");
+  }
+  Blynk.virtualWrite(V5, pumpState);
+}
+
+// ---------------- WEATHER FUNCTION ----------------
+void getWeatherData() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(weatherURL);
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode == 200) {
+      String payload = http.getString();
+      DynamicJsonDocument doc(1024);
+      deserializeJson(doc, payload);
+
+      lastWeatherDesc = doc["weather"][0]["main"].as<String>();
+      lastWeatherTemp = doc["main"]["temp"].as<float>();
+
+      String weatherData = lastWeatherDesc + " | " + String(lastWeatherTemp) + "C";
+      Blynk.virtualWrite(V6, weatherData);
+      Blynk.virtualWrite(V7, lastWeatherTemp);
+
+      lcd.setCursor(0, 3);
+      lcd.print("Weather:");
+      lcd.print(lastWeatherDesc);
+      lcd.print("   ");
+    }
+    http.end();
+  } else {
+    lcd.setCursor(0, 3);
+    lcd.printf("Weather:%s %.1fC", lastWeatherDesc.c_str(), lastWeatherTemp);
+  }
+}
+
+// ---------------- BUZZER CONTROL ----------------
+void startBuzzer() {
+  buzzerActive = true;
+  buzzerStartAt = millis();
+  lastBeepToggle = 0;
+  buzzerState = false;
+}
+
+void stopBuzzer() {
+  digitalWrite(BUZZER_PIN, LOW);
+  buzzerActive = false;
+}
+
+void updateBuzzer() {
+  if (!buzzerActive) return;
+
+  if (millis() - buzzerStartAt >= BUZZER_DURATION_MS) {
+    stopBuzzer();
+    return;
+  }
+
+  if (millis() - lastBeepToggle >= BEEP_INTERVAL_MS) {
+    buzzerState = !buzzerState;
+    digitalWrite(BUZZER_PIN, buzzerState);
+    lastBeepToggle = millis();
+  }
+}
+
+// ---------------- SENSOR CONTROL ----------------
+void sendSensorData() {
+  int soilValue = analogRead(SOIL_SENSOR);
+  int soilMoisture = map(soilValue, soilMax, soilMin, 0, 100);
+  soilMoisture = constrain(soilMoisture, 0, 100);
+
+  int lightLevel = analogRead(LDR_SENSOR);
+  int lightPercentage = map(lightLevel, 1800, 70, 100, 0); // ✅ Calibrated LDR
+  lightPercentage = constrain(lightPercentage, 0, 100);
+
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  int adjustedThreshold = moistureThreshold;
+  if (temperature > 30) adjustedThreshold += 5;
+  if (humidity > 70) adjustedThreshold -= 5;
+  adjustedThreshold = constrain(adjustedThreshold, 30, 70);
+
+  // Send data to Blynk
+  Blynk.virtualWrite(V0, soilMoisture);
+  Blynk.virtualWrite(V1, temperature);
+  Blynk.virtualWrite(V2, humidity);
+  Blynk.virtualWrite(V3, lightPercentage);
+  Blynk.virtualWrite(V5, pumpState);
+
+  // === LCD Display ===
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.printf("Temp:%.1fC Hum:%.1f%%", temperature, humidity);
+
+  // Environmental interpretation
+  if (temperature > 32 && humidity < 40)
+    lcd.setCursor(0, 1), lcd.print("Hot & Dry: NeedWater");
+  else if (temperature < 18 && humidity > 70)
+    lcd.setCursor(0, 1), lcd.print("Cool & Damp: NoNeed ");
+  else
+    lcd.setCursor(0, 1), lcd.printf("Moist:%d%% Light:%d%% ", soilMoisture, lightPercentage);
+
+  // === WATERING LOGIC ===
+  if (!manualMode) {
+    if (soilMoisture >= 89) {
+      digitalWrite(RELAY_PIN, LOW);
+      pumpState = false;
+      lcd.setCursor(0, 2); lcd.print("Overwatered: PumpOFF ");
+    } 
+    else if (soilMoisture < adjustedThreshold && temperature > 25 && humidity < 60) {
+      digitalWrite(RELAY_PIN, HIGH);
+      pumpState = true;
+      lcd.setCursor(0, 2); lcd.print("Dry Soil: Pump ON    ");
+    } 
+    else {
+      digitalWrite(RELAY_PIN, LOW);
+      pumpState = false;
+      lcd.setCursor(0, 2); lcd.print("Soil OK: Pump OFF    ");
+    }
+  }
+
+  // === Manual Button Toggle ===
+  static unsigned long lastPress = 0;
+  if (digitalRead(BUTTON_PIN) == LOW && millis() - lastPress > 300) {
+    manualMode = !manualMode;
+    manualStartTime = millis();
+    digitalWrite(RELAY_PIN, !digitalRead(RELAY_PIN));
+    pumpState = digitalRead(RELAY_PIN);
+    lcd.setCursor(0, 3); lcd.print("Manual Button Used   ");
+    lastPress = millis();
+  }
+
+  // Resume automation
+  if (manualMode && millis() - manualStartTime > manualDuration) {
+    manualMode = false;
+    lcd.setCursor(0, 3); lcd.print("Automation Resumed   ");
+  }
+
+  // Status indicators
+  digitalWrite(LED_PIN, pumpState ? HIGH : LOW);
+  if (pumpState && soilMoisture < adjustedThreshold && !buzzerActive) startBuzzer();
+  else if (!pumpState) stopBuzzer();
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(OFFLINE_LED, OUTPUT);
+
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(OFFLINE_LED, LOW);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0); lcd.print("Smart Irrigation");
+  lcd.setCursor(0, 1); lcd.print("by Dalitso Mbewe");
+  delay(2000);
+  lcd.clear();
+  lcd.print("Connecting WiFi...");
+
+  dht.begin();
+  WiFi.begin(ssid, pass);
+
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    lcd.clear(); lcd.print("WiFi Connected!");
+    Serial.println("\n✅ WiFi Connected");
+    offlineMode = false;
+    digitalWrite(OFFLINE_LED, LOW);
+  } else {
+    lcd.clear(); lcd.print("WiFi Failed - Offline");
+    Serial.println("\n⚠️ WiFi Failed - Offline Mode");
+    offlineMode = true;
+    digitalWrite(OFFLINE_LED, HIGH);
+  }
+
+  if (!offlineMode) {
+    Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  }
+
+  timer.setInterval(5000L, sendSensorData);
+  timer.setInterval(60000L, getWeatherData);
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  if (!offlineMode) Blynk.run();
+  timer.run();
+  updateBuzzer();
+}
+)
+  </pre>
+
+  <a href="code.ino">Download Full Arduino Code</a>
+</body>
+</html>
